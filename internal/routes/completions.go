@@ -134,7 +134,7 @@ func convertCompletionsToolContentToGeminiParts(contents []completionsContent, t
 	part := geminiPart{
 		FunctionResponse: &functionResponse{
 			Name: toolName,
-			Response: map[string]string{
+			Response: map[string]interface{}{
 				"result": builder.String(),
 			},
 		},
@@ -210,30 +210,24 @@ func mergeCompletionsParameters(target *cfg.GenerationConfig, source *completion
 		} else {
 			think = thinkLevel(source.ReasoningEffort)
 		}
-		var thoughts bool
+		// reasoning_effort controls whether Gemini does internal reasoning
+		// It's separate from includeThoughts which controls whether we expose it
+		// Only set thinkingConfig if reasoning is enabled
 		if think != "none" {
-			thoughts = true
-		} else {
-			if strings.HasPrefix(source.Model, "gemini-2.5-pro") {
-				thoughts = true
+			var thinkingBudget int
+			if source.ThinkingBudget != nil {
+				thinkingBudget = *source.ThinkingBudget
 			} else {
-				thoughts = false
+				var err error
+				thinkingBudget, err = GetThinkingBudget(source.Model, think)
+				if err != nil {
+					return err
+				}
 			}
+			// Enable thinking in Gemini, but includeThoughts is controlled by config
+			// Don't override the includeThoughts from model-defaults.json here
+			target.ThinkingConfig.ThinkingBudget = &thinkingBudget
 		}
-		target.ThinkingConfig = cfg.ThinkingConfig{
-			IncludeThoughts: thoughts,
-		}
-		var thinkingBudget int
-		if source.ThinkingBudget != nil {
-			thinkingBudget = *source.ThinkingBudget
-		} else {
-			var err error
-			thinkingBudget, err = GetThinkingBudget(source.Model, think)
-			if err != nil {
-				return err
-			}
-		}
-		target.ThinkingConfig.ThinkingBudget = &thinkingBudget
 	}
 	return nil
 }
@@ -257,28 +251,50 @@ func convertCompletionsBodyToGemini(input *completionsInput) (interface{}, error
 	return body, nil
 }
 
-func prepareCompletionsBody(input *completionsInput) (string, interface{}, interface{}, error) {
+func prepareCompletionsBody(input *completionsInput) (string, interface{}, interface{}, bool, error) {
 	urlPrefix := input.Model + ":generateContent"
 	body, err := convertCompletionsBodyToGemini(input)
 	if err != nil {
-		return "", nil, nil, err
+		return "", nil, nil, false, err
 	}
-	return urlPrefix, body, &geminiCompleteOutput{}, nil
+	// Get the includeThoughts setting from the merged configuration
+	generationConfig := cfg.Defaults.GeminiDefaults.GenerationConfig
+	if err := mergeCompletionsParameters(&generationConfig, input); err != nil {
+		return "", nil, nil, false, err
+	}
+	includeThoughts := generationConfig.ThinkingConfig.IncludeThoughts
+	return urlPrefix, body, &geminiCompleteOutput{}, includeThoughts, nil
 }
 
-func prepareCompletionsStream(input *completionsInput) (string, interface{}, interface{}, interface{}, error) {
+func prepareCompletionsStream(input *completionsInput) (string, interface{}, interface{}, interface{}, bool, error) {
 	urlPrefix := input.Model + ":streamGenerateContent?alt=sse"
 	body, err := convertCompletionsBodyToGemini(input)
 	if err != nil {
-		return "", nil, nil, nil, err
+		return "", nil, nil, nil, false, err
 	}
-	return urlPrefix, body, &geminiPartialOutput{}, &geminiFinalOutput{}, nil
+	// Get the includeThoughts setting from the merged configuration
+	generationConfig := cfg.Defaults.GeminiDefaults.GenerationConfig
+	if err := mergeCompletionsParameters(&generationConfig, input); err != nil {
+		return "", nil, nil, nil, false, err
+	}
+	includeThoughts := generationConfig.ThinkingConfig.IncludeThoughts
+	return urlPrefix, body, &geminiPartialOutput{}, &geminiFinalOutput{}, includeThoughts, nil
+}
+
+// openAIFunction is used for OpenAI API responses where arguments must be a JSON string
+type openAIFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"` // Must be a JSON string, not an object
+}
+
+type openAIToolCall struct {
+	Function openAIFunction `json:"function"`
 }
 
 type outputMessage struct {
-	Role      string     `json:"role"`
-	Content   string     `json:"content"`
-	ToolCalls []toolCall `json:"tool_calls,omitempty"`
+	Role      string           `json:"role"`
+	Content   string           `json:"content"`
+	ToolCalls []openAIToolCall `json:"tool_calls,omitempty"`
 }
 
 type deltaChoice struct {
@@ -318,26 +334,46 @@ type completionsDeltaResponse struct {
 	Choices []deltaChoice `json:"choices"`
 }
 
-func createCompletionsResponse(model string, chunked bool) completionsResponse {
-	now := time.Now().UTC()
-	var object string
-	if chunked {
-		object = "chat.completion.chunk"
-	} else {
-		object = "chat.completion"
+func createCompletionsResponse(model string, object bool) completionsResponse {
+	now := time.Now().Unix()
+	timestamp := time.Unix(now, 0).UTC().Format("2006-01-02T15:04:05Z")
+	objType := "chat.completion"
+	if object {
+		objType = "chat.completion.chunk"
 	}
 	return completionsResponse{
+		ID:                timestamp,
 		Model:             model,
-		Created:           now.Unix(),
-		ID:                now.Format(time.RFC3339),
-		Object:            object,
+		Created:           now,
+		Object:            objType,
 		SystemFingerprint: "fp_gemini",
 	}
 }
 
+// convertFunctionCallsToOpenAIToolCalls converts internal functionCall structs to OpenAI API format
+// where arguments must be a JSON-encoded string, not an object
+func convertFunctionCallsToOpenAIToolCalls(functionCalls []functionCall) []openAIToolCall {
+	toolCalls := make([]openAIToolCall, len(functionCalls))
+	for i, functionCall := range functionCalls {
+		// Marshal the arguments map to a JSON string
+		argsJSON, err := json.Marshal(functionCall.Args)
+		if err != nil {
+			// Fallback to empty object if marshaling fails
+			argsJSON = []byte("{}")
+		}
+		toolCalls[i] = openAIToolCall{
+			Function: openAIFunction{
+				Name:      functionCall.Name,
+				Arguments: string(argsJSON),
+			},
+		}
+	}
+	return toolCalls
+}
+
 func HandleCompletions(w http.ResponseWriter, r *http.Request) int {
 	input := completionsInput{
-		ReasoningEffort: "medium",
+		ReasoningEffort: "medium", // Default reasoning effort per OpenAI spec
 		Stream:          false,
 	}
 	reqPayload, err := io.ReadAll(r.Body)
@@ -376,7 +412,7 @@ func HandleCompletions(w http.ResponseWriter, r *http.Request) int {
 	}
 
 	if input.Stream {
-		urlSuffix, reqBody, partialOutput, finalOutput, err := prepareCompletionsStream(&input)
+		urlSuffix, reqBody, partialOutput, finalOutput, includeThoughts, err := prepareCompletionsStream(&input)
 		if err != nil {
 			return wrongInput(w, err.Error())
 		}
@@ -405,6 +441,7 @@ func HandleCompletions(w http.ResponseWriter, r *http.Request) int {
 				f.Flush()
 			}
 			var content string
+			var thinking string
 			var functionCalls []functionCall
 			var reason string
 			var promptTokens int
@@ -415,18 +452,23 @@ func HandleCompletions(w http.ResponseWriter, r *http.Request) int {
 			} else {
 				reader = resReader
 			}
-			_, content, functionCalls, reason, rest, promptTokens, contentTokens, err = extractStreamGeminiResponse(reader, partialOutput, finalOutput)
+			thinking, content, functionCalls, reason, rest, promptTokens, contentTokens, err = extractStreamGeminiResponse(reader, partialOutput, finalOutput)
 			var resBody any
 			final := false
 			if err != nil {
 				break
 			}
-			toolCalls := convertFunctionCallsToToolCalls(functionCalls)
+			toolCalls := convertFunctionCallsToOpenAIToolCalls(functionCalls)
 			final = len(reason) > 0
 			var outputReason *string
 			if final {
 				stringReason := strings.ToLower(reason)
 				outputReason = &stringReason
+			}
+			// Combine thinking with content only if includeThoughts is enabled
+			outputContent := content
+			if includeThoughts && len(thinking) > 0 {
+				outputContent = thinking + content
 			}
 			resBody = &completionsDeltaResponse{
 				completionsResponse: createCompletionsResponse(input.Model, true),
@@ -434,7 +476,7 @@ func HandleCompletions(w http.ResponseWriter, r *http.Request) int {
 					{
 						Delta: outputMessage{
 							Role:      "assistant",
-							Content:   content,
+							Content:   outputContent,
 							ToolCalls: toolCalls,
 						},
 						FinishReason: outputReason,
@@ -484,7 +526,7 @@ func HandleCompletions(w http.ResponseWriter, r *http.Request) int {
 			}
 		}
 	} else {
-		urlSuffix, reqBody, output, err := prepareCompletionsBody(&input)
+		urlSuffix, reqBody, output, includeThoughts, err := prepareCompletionsBody(&input)
 		if err != nil {
 			return wrongInput(w, err.Error())
 		}
@@ -492,21 +534,26 @@ func HandleCompletions(w http.ResponseWriter, r *http.Request) int {
 		if err != nil {
 			return failRequest(w, status, err.Error())
 		}
-		_, content, functionCalls, reason, promptTokens, contentTokens := extractCompleteGeminiResponse(output)
+		thinking, content, functionCalls, reason, promptTokens, contentTokens := extractCompleteGeminiResponse(output)
 		tokens := promptTokens + contentTokens
 		if log.IsDbg {
 			log.Dbg("< answer by %s with %d character%s and %d token%s", input.Model,
 				len(content), log.GetPlural(len(content)), tokens, log.GetPlural(tokens))
 		}
-		toolCalls := convertFunctionCallsToToolCalls(functionCalls)
+		toolCalls := convertFunctionCallsToOpenAIToolCalls(functionCalls)
 		outputReason := strings.ToLower(reason)
+		// Combine thinking with content only if includeThoughts is enabled
+		outputContent := content
+		if includeThoughts && len(thinking) > 0 {
+			outputContent = thinking + content
+		}
 		resBody := &completionsCompleteResponse{
 			completionsResponse: createCompletionsResponse(input.Model, false),
 			Choices: []completeChoice{
 				{
 					Message: outputMessage{
 						Role:      "assistant",
-						Content:   content,
+						Content:   outputContent,
 						ToolCalls: toolCalls,
 					},
 					FinishReason: &outputReason,
