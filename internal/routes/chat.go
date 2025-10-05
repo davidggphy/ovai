@@ -48,7 +48,7 @@ type chatInput struct {
 	Options  modelParameters `json:"options"`
 }
 
-func convertChatMessagesToGemini(messages []message) ([]geminiContent, error) {
+func convertChatMessagesToGemini(messages []message) ([]geminiContent, []geminiPart, error) {
 	systemMessages := make([]geminiPart, 0, 1)
 	chatMessages := make([]geminiContent, 0, len(messages))
 	for _, msg := range messages {
@@ -66,11 +66,11 @@ func convertChatMessagesToGemini(messages []message) ([]geminiContent, error) {
 			case "tool":
 				role = "user"
 			default:
-				return nil, fmt.Errorf("invalid chat message role: %q", msg.Role)
+				return nil, nil, fmt.Errorf("invalid chat message role: %q", msg.Role)
 			}
 			parts, err := convertContentToGeminiParts(msg.Content, msg.Images, msg.ToolCalls, msg.ToolName)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			chatMessages = append(chatMessages, geminiContent{
 				Role:  role,
@@ -78,20 +78,19 @@ func convertChatMessagesToGemini(messages []message) ([]geminiContent, error) {
 			})
 		}
 	}
-	if len(chatMessages) == 0 {
-		return []geminiContent{}, errors.New("no user message found")
+	// Gemini API requires at least one of: contents with parts OR system_instruction
+	// If we only have system messages, that's okay - we'll use systemInstruction field
+	if len(chatMessages) == 0 && len(systemMessages) == 0 {
+		return nil, nil, errors.New("no messages found")
 	}
-	if len(systemMessages) > 0 {
-		chatMessages[0].Parts = append(systemMessages, chatMessages[0].Parts...)
-	}
-	return chatMessages, nil
+	return chatMessages, systemMessages, nil
 }
 
 func stripSchemaFromParameters(params interface{}) interface{} {
 	if params == nil {
 		return nil
 	}
-	
+
 	// Convert to map to manipulate
 	if paramsMap, ok := params.(map[string]interface{}); ok {
 		// Create a new map without $schema
@@ -103,7 +102,7 @@ func stripSchemaFromParameters(params interface{}) interface{} {
 		}
 		return cleaned
 	}
-	
+
 	return params
 }
 
@@ -138,7 +137,7 @@ func convertToolsToGemini(inputTools []FunctionTool) []toolsWrapper {
 }
 
 func convertChatBodyToGemini(input *chatInput) (interface{}, error) {
-	chatMessages, err := convertChatMessagesToGemini(input.Messages)
+	chatMessages, systemMessages, err := convertChatMessagesToGemini(input.Messages)
 	if err != nil {
 		return nil, err
 	}
@@ -152,6 +151,12 @@ func convertChatBodyToGemini(input *chatInput) (interface{}, error) {
 		GenerationConfig: generationConfig,
 		SafetySettings:   cfg.Defaults.GeminiDefaults.SafetySettings,
 		Tools:            tools,
+	}
+	// Add system instruction if we have system messages
+	if len(systemMessages) > 0 {
+		body.SystemInstruction = &geminiSystemInstruction{
+			Parts: systemMessages,
+		}
 	}
 	return body, nil
 }

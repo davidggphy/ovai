@@ -441,7 +441,7 @@ func HandleCompletions(w http.ResponseWriter, r *http.Request) int {
 				f.Flush()
 			}
 			var content string
-                        var thinking string
+			var thinking string
 			var functionCalls []functionCall
 			var reason string
 			var promptTokens int

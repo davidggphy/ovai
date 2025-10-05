@@ -68,11 +68,16 @@ type toolsWrapper struct {
 	FunctionDeclarations []interface{} `json:"functionDeclarations,omitempty"`
 }
 
+type geminiSystemInstruction struct {
+	Parts []geminiPart `json:"parts"`
+}
+
 type geminiBody struct {
-	Contents         []geminiContent      `json:"contents"`
-	GenerationConfig cfg.GenerationConfig `json:"generationConfig"`
-	SafetySettings   []cfg.SafetySetting  `json:"safetySettings"`
-	Tools            []toolsWrapper       `json:"tools,omitempty"`
+	Contents          []geminiContent          `json:"contents,omitempty"`
+	SystemInstruction *geminiSystemInstruction `json:"systemInstruction,omitempty"`
+	GenerationConfig  cfg.GenerationConfig     `json:"generationConfig"`
+	SafetySettings    []cfg.SafetySetting      `json:"safetySettings"`
+	Tools             []toolsWrapper           `json:"tools,omitempty"`
 }
 
 type geminiCandidate struct {
