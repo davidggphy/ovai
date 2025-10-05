@@ -42,13 +42,13 @@ type inlineData struct {
 }
 
 type functionCall struct {
-	Name string            `json:"name"`
-	Args map[string]string `json:"args"`
+	Name string                 `json:"name"`
+	Args map[string]interface{} `json:"args"`
 }
 
 type functionResponse struct {
-	Name     string            `json:"name"`
-	Response map[string]string `json:"response"`
+	Name     string                 `json:"name"`
+	Response map[string]interface{} `json:"response"`
 }
 
 type geminiPart struct {
@@ -276,7 +276,7 @@ func convertContentToGeminiParts(content string, images []string, toolCalls []to
 		part := geminiPart{
 			FunctionResponse: &functionResponse{
 				Name: toolName,
-				Response: map[string]string{
+				Response: map[string]interface{}{
 					"result": content,
 				},
 			},

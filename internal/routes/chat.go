@@ -17,8 +17,8 @@ import (
 )
 
 type function struct {
-	Name      string            `json:"name"`
-	Arguments map[string]string `json:"arguments"`
+	Name      string                 `json:"name"`
+	Arguments map[string]interface{} `json:"arguments"`
 }
 
 type toolCall struct {
@@ -87,13 +87,46 @@ func convertChatMessagesToGemini(messages []message) ([]geminiContent, error) {
 	return chatMessages, nil
 }
 
+func stripSchemaFromParameters(params interface{}) interface{} {
+	if params == nil {
+		return nil
+	}
+	
+	// Convert to map to manipulate
+	if paramsMap, ok := params.(map[string]interface{}); ok {
+		// Create a new map without $schema
+		cleaned := make(map[string]interface{})
+		for key, value := range paramsMap {
+			if key != "$schema" {
+				cleaned[key] = value
+			}
+		}
+		return cleaned
+	}
+	
+	return params
+}
+
 func convertToolsToGemini(inputTools []FunctionTool) []toolsWrapper {
 	var tools []toolsWrapper
 	toolCount := len(inputTools)
 	if toolCount > 0 {
 		functions := make([]interface{}, toolCount)
 		for i, function := range inputTools {
-			functions[i] = function.Function
+			// Strip $schema from function parameters
+			if funcMap, ok := function.Function.(map[string]interface{}); ok {
+				cleanedFunc := make(map[string]interface{})
+				for key, value := range funcMap {
+					if key == "parameters" {
+						cleanedFunc[key] = stripSchemaFromParameters(value)
+					} else {
+						cleanedFunc[key] = value
+					}
+				}
+				functions[i] = cleanedFunc
+			} else {
+				functions[i] = function.Function
+			}
 		}
 		tools = []toolsWrapper{
 			{
